@@ -1,0 +1,1 @@
+This repository contains the work I have done in my research at the Electric Propulsion Laboratory (EPLab) with Professor Joshua Rovey. My work involves assisting the studies for alternative propellants of electron cyclotron resonance (ECR) thruster by developing global plasma models that solve for species densities and electron temperature.
