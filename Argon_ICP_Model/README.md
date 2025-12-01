@@ -15,6 +15,6 @@ Current Validation Status:
 2. Neural Network Surrogate (In Development)
 To enable rapid parametric studies and model-predictive control, I am developing a data-driven surrogate model trained on the physics-based solver's output.
 The Pipeline:
-  1. Data Generation: The ODE solver is run across a sweep of input parameters (Pressure: 1–50 mTorr, Power: 100–1000 W).
-  2. Architecture: A Multi-Layer Perceptron (MLP) is trained to map inputs $(P, \mathcal{P}_{abs})$ directly to steady-state plasma properties $(n_{species}, T_e)$.
-  3. Objective: Minimize the Mean Squared Error (MSE) between the ODE solution and the NN prediction.
+  - Data Generation: The ODE solver is run across a sweep of input parameters (Pressure: 1–50 mTorr, Power: 100–1000 W).
+  - Architecture: A Multi-Layer Perceptron (MLP) is trained to map inputs $(P, \mathcal{P}_{abs})$ directly to steady-state plasma properties $(n_{species}, T_e)$.
+  - Objective: Minimize the Mean Squared Error (MSE) between the ODE solution and the NN prediction.
