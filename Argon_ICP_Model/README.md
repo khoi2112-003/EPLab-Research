@@ -20,3 +20,14 @@ The Pipeline:
   - Data Generation: The ODE solver is run across a sweep of input parameters (Pressure: 1–50 mTorr, Power: 100–1000 W).
   - Architecture: A Multi-Layer Perceptron (MLP) is trained to map inputs $(P, \mathcal{P}_{abs})$ directly to steady-state plasma properties $(n_{species}, T_e)$.
   - Objective: Minimize the Mean Squared Error (MSE) between the ODE solution and the NN prediction.
+
+To run,
+
+# Clone the repository
+git clone https://github.com/khoi2112-003/EPLab-Research/edit/main/Argon_ICP_Model
+
+# Navigate to the directory
+cd Argon_ICP_Model/Code
+
+# Run the main solver script
+Ar_script
