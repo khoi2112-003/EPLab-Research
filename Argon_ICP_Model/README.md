@@ -24,7 +24,7 @@ The Pipeline:
 To run,
 
 # Clone the repository
-git clone https://github.com/khoi2112-003/EPLab-Research/edit/main/Argon_ICP_Model
+git clone https://github.com/khoi2112-003/EPLab-Research.git
 
 # Navigate to the directory
 cd Argon_ICP_Model/Code
