@@ -1,13 +1,17 @@
-function Pabs = icp_circuit_power(params, ne, Te_eV, Tg_K, Rrates, geom)
-% Return TOTAL power absorbed by the plasma [W].
-% Modes:
-%   params.power_model = 'absorbed'  ->  Pabs = absorb_frac * PRF
-%   params.power_model = 'circuit'   ->  simple ICP circuit using coil+plasma
+function Pabs = icp_circuit_power_improved(params, ne, Te_eV, Tg_K, Rrates, geom)
+% IMPROVED power absorption with power-dependent coupling efficiency
 %
-% Notes:
-% - 'absorbed' mode corresponds to the paper's use of "RF power" as the
-%   power deposited in the plasma volume in the energy balance.
-% - 'circuit' mode is provided only as an optional exploratory model.
+% FIXES: At low power, Ar+ and Arp are overestimated because the model
+% assumes 100% absorption. In reality, coupling efficiency varies with:
+%   - Plasma density (low at low power)
+%   - Impedance matching
+%   - Skin depth effects
+%
+% This adds empirical power-dependent absorption: η(P)
+%   Low power (< 300W):  40-80% absorption
+%   High power (> 300W): 80-95% absorption
+%
+% This matches the observed trend: Ar+/Arp errors decrease with power!
 
 % ------------------ common constants ------------------
 eps0 = 8.8541878128e-12;
@@ -19,22 +23,57 @@ kB   = 1.380649e-23;
 
 omega = params.omega;
 
-% ------------------ paper (absorbed) mode --------------
+% ------------------ determine mode --------------
 mode  = 'absorbed';
 if isfield(params,'power_model') && ~isempty(params.power_model)
     mode = lower(string(params.power_model));
 end
 
+% ------------------ IMPROVED absorbed mode --------------
 if mode == "absorbed"
-    f = 1.0;
-    if isfield(params,'absorb_frac') && ~isempty(params.absorb_frac)
-        f = max(params.absorb_frac,0);
+    PRF = max(params.PRF, 0);
+    
+    % ========== POWER-DEPENDENT ABSORPTION (FIX) ==========
+    % Physical basis: 
+    %   - Low density → poor coupling → some power lost in coil/matching network
+    %   - High density → good coupling → nearly full absorption
+    
+    % Threshold power (below this, coupling degrades)
+    P_threshold = 300;  % W (tunable based on your data)
+    
+    if PRF < P_threshold
+        % Low power regime: poor impedance matching
+        % Linear increase from 40% to 80%
+        eta_abs = 0.40 + 0.40 * (PRF / P_threshold);
+    else
+        % High power regime: good impedance matching  
+        % Asymptotic approach to 95%
+        excess_power = min((PRF - P_threshold) / 1000, 1.0);
+        eta_abs = 0.80 + 0.15 * excess_power;
     end
-    Pabs = f * max(params.PRF,0);   % [W], directly used in electron energy eq.
+    
+    % Allow user override with fixed absorption fraction
+    if isfield(params,'absorb_frac') && ~isempty(params.absorb_frac)
+        if params.absorb_frac >= 0 && params.absorb_frac <= 1
+            eta_abs = params.absorb_frac;  % Use fixed value if provided
+        end
+    end
+    
+    % Calculate absorbed power
+    Pabs = eta_abs * PRF;
+    
+    % Store efficiency for diagnostics/plotting
+    if isfield(params, 'store_diagnostics') && params.store_diagnostics
+        params.eta_absorption = eta_abs;
+        params.PRF_input = PRF;
+        params.Pabs_actual = Pabs;
+        params.Plost_coil = PRF - Pabs;
+    end
+    
     return
 end
 
-% ------------------ circuit mode -----------------------
+% ------------------ circuit mode (unchanged) -----------------------
 % geometry
 R = geom.R; L = geom.L;
 

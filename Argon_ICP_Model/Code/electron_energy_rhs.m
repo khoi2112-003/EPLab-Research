@@ -1,5 +1,6 @@
-function dTe_dt = electron_energy_rhs(~, y, params, R)
+function dTe_dt = electron_energy_rhs(~, y, params, R, ~)
 % y = [nAr nArm nArr nArp nI Te Tg]; Te in eV -> dTe/dt (eV/s)
+% FIXED VERSION: Corrected n_is calculation for ion wall losses
 
 % unpack / floors
 nAr  = max(y(1),0);  
@@ -23,10 +24,8 @@ A_side=2*pi*Rch*Lch;
 A=A_ends+A_side;
 V=pi*Rch^2*Lch;
 
-% CORRECTED: Calculate absorbed power properly (PRF - Pcoil)
-% First calculate Rind and Rcoil to find Pcoil
-n_g = params.p0/(kB*Tg);  % Use Tg0 (300K) not current Tg
-%n_g = nAr + nArp + nArm + nArr;
+% Calculate absorbed power properly
+n_g = nAr + nArp + nArm + nArr;
 Kel = max(R.k1, 0);
 nu_m = n_g * Kel;  % electron-neutral collision frequency
 
@@ -34,12 +33,10 @@ nu_m = n_g * Kel;  % electron-neutral collision frequency
 Rind = calc_rind(params, ne, nu_m);
 
 % Get Rcoil from parameters
-Rcoil = 2;  % From Table 2 in the paper
+Rcoil = 2;  % Default from Table 2
 if isfield(params, 'Rcoil')
     Rcoil = params.Rcoil;
 end
-
-
 
 % Calculate current from PRF = 0.5*(Rind + Rcoil)*I^2
 PRF = max(params.PRF, 0);
@@ -49,14 +46,14 @@ I_squared = 2 * PRF / Rtotal;
 % Calculate Pcoil = 0.5 * Rcoil * I^2
 Pcoil = 0.5 * Rcoil * I_squared;
 
-% CORRECTED: Pabs = (PRF - Pcoil) / V
+% Pabs = (PRF - Pcoil) / V
 Pabs_total = max(PRF - Pcoil, 0);  % Total absorbed power in W
 Pabs = Pabs_total / max(V, 1e-12);  % Power density in W/m^3
 
 % Ion mean free path and effective area factors
 lambda_i = 1 / max(params.sigma_i*n_g, 1e-12);
 
-% Effective area factors (hL and hR from paper)
+% Effective area factors (hL and hR from paper Eq. 6-7)
 hL = 0.86*(3 + Lch/(2*lambda_i))^(-0.5);  
 hR = 0.80*(4 + Rch/lambda_i)^(-0.5);
 Aeff = hL*A_ends + hR*A_side;
@@ -65,16 +62,22 @@ Aeff = hL*A_ends + hR*A_side;
 uB = sqrt(qe*Te/MAr);  % Bohm velocity (same as cs)
 Vs_eV = 0.5*Te*log(MAr/(2*pi*me));  % sheath potential (eV)
 
-% Pew uses electron density at sheath (n_es)  
-n_es = nI * exp(-Vs_eV/Te);          % Boltzmann relation
-n_is = n_es;  % For electropositive plasma
+% ============ FIXED: ELECTRON WALL LOSS ============
+% Electron density at sheath uses Boltzmann relation (electrons repelled)
+n_es = nI * exp(-Vs_eV/Te);
 epsilon_ew = 2.0*Te;  % energy per electron lost (eV)
 Pew = (A/V)*n_es*uB*(epsilon_ew*qe);  % electron wall power density
 
-% Ion wall power loss
+% ============ FIXED: ION WALL LOSS ============
+% Ion sheath edge density uses hL, hR factors (ions accelerated toward wall)
+% NOT the Boltzmann factor! This was the bug.
+% 
+% The paper (Eq. 5) says particle loss uses Aeff = hL*A_ends + hR*A_side
+% For energy loss, use area-weighted ion density at sheath edge:
+n_is = (hL*A_ends + hR*A_side) / A * nI;  % = Aeff/A * nI
+
 epsilon_iw = Vs_eV + 0.5*Te;  % energy per ion lost (eV)
 Piw = (A/V)*n_is*uB*(epsilon_iw*qe);  % ion wall power density
-
 
 % Energy levels
 eps_2 = 15.76; 
@@ -88,15 +91,12 @@ eps_12 = 1.6;
 eps_13 = 1.2; 
 eps_14 = 1.1;
 
-% CORRECTED: Calculate epsilon_c using equation (13) from the paper
-% epsilon_c^(X) = eps_iz + sum_l(k_exl^(X)/k_iz) + (3*me*kel*Te)/(M*k_iz)
-% For each ionizing species X, calculate its epsilon_c
+% Calculate epsilon_c using equation (13) from the paper
+% epsilon_c^(X) = eps_iz + sum_l(k_exl^(X)/k_iz)*eps_exl + (3*me*kel*Te)/(M*k_iz)
 
 % Ground state Ar ionization with associated excitations
-if R.k2 > 1e-30  % Avoid division by zero
-    % Excitation to loss ratio for ground state
+if R.k2 > 1e-30
     excit_ratio_g = (R.k6*eps_6 + R.k7*eps_7 + R.k8*eps_8)/R.k2;
-    % Elastic energy transfer per ionization
     elastic_ratio_g = (3*me/MAr)*Kel*Te/R.k2;
     epsilon_c_g = eps_2 + excit_ratio_g + elastic_ratio_g;
 else
@@ -105,7 +105,6 @@ end
 
 % Metastable Ar* ionization
 if R.k3 > 1e-30
-    % For metastable, consider excitations from metastable state
     excit_ratio_m = (R.k12*eps_12 + R.k13*eps_13)/R.k3;
     elastic_ratio_m = (3*me/MAr)*Kel*Te/R.k3;
     epsilon_c_m = eps_3 + excit_ratio_m + elastic_ratio_m;
@@ -122,7 +121,7 @@ else
     epsilon_c_r = eps_4;
 end
 
-% 4p state Ar^p ionization (no further excitations from this level)
+% 4p state Ar^p ionization
 if R.k5 > 1e-30
     elastic_ratio_p = (3*me/MAr)*Kel*Te/R.k5;
     epsilon_c_p = eps_5 + elastic_ratio_p;
@@ -130,23 +129,14 @@ else
     epsilon_c_p = eps_5;
 end
 
-% Power lost due to ionization from each state using its specific epsilon_c
+% Power lost due to ionization from each state (Paper Eq. 12: Pev term)
 P_ion = ne * qe * (R.k2*nAr*epsilon_c_g + R.k3*nArm*epsilon_c_m + ...
                    R.k4*nArr*epsilon_c_r + R.k5*nArp*epsilon_c_p);
-%P_ion = ne * qe * R.k2*nAr*epsilon_c_g
-TeJ = Te * qe;
-% CORRECTED: Pev now only includes P_ion (which contains all losses via epsilon_c formula)
-% and de-excitation returns (energy gains)
-% Pev = P_ion + P_dex_g + P_dex_x;
+
 Pev = P_ion;
-% Continuous elastic cooling (required for energy conservation with gas equation)
-%P_el = 3*(me/MAr) * ne * n_g * Kel * (TeJ - kB*Tg);
 
-% Total 
-%Pev = P_ion + P_el;  % Even though paper shows only P_ion
-
-% total electron power balance -> Te ODE
+% Total electron power balance (Paper Eq. 11-12)
 Ploss = Piw + Pew + Pev;
-denom = 1.5*ne*qe;  % J m^-3 per eV
+denom = 1.5*ne*qe;
 dTe_dt = (Pabs - Ploss)/max(denom,1e-30);
 end

@@ -1,261 +1,399 @@
-%% Plot Densities vs Absorbed Power (Pabs)
+%% generate_nn_training_data.m
+% Generate training data for NN surrogate model
+% Sweep: Power x Pressure
+% Outputs: Densities (nAr, nArm, nArr, nArp, ne) + Tg
+% Te excluded due to known 0D model limitations (~3-5% error)
 
-clear; clc; close all
+clear; clc; close all;
 
-% --- geometry & constants
-geom.R   = 0.06;
-geom.L   = 0.10;
+fprintf('========================================\n');
+fprintf('NN SURROGATE TRAINING DATA GENERATION\n');
+fprintf('Power x Pressure Sweep\n');
+fprintf('========================================\n\n');
+
+%% Step 1: Define Parameter Ranges
+% Grid: 100 x 65 = 6500 points (expect ~5000+ successful)
+% Restricted to stable pressure range (1-6 mTorr)
+P_min = 200;   P_max = 1600;  N_power = 100;
+p_min = 1;     p_max = 6;     N_pressure = 65;  % mTorr - restricted for stability
+
+power_vec = linspace(P_min, P_max, N_power);
+pressure_vec = linspace(p_min, p_max, N_pressure);  % mTorr
+
+% Convert pressure to Pa (1 mTorr = 0.133322 Pa)
+pressure_Pa_vec = pressure_vec * 0.133322;
+
+N_total = N_power * N_pressure;
+fprintf('Power: %d points (%.0f - %.0f W)\n', N_power, P_min, P_max);
+fprintf('Pressure: %d points (%.1f - %.1f mTorr)\n', N_pressure, p_min, p_max);
+fprintf('Total training points: %d\n\n', N_total);
+
+%% Step 2: Setup Model Parameters (OPTIMIZED VALUES)
+% These are from the n_is-fixed model optimization
+% Validation errors: All outputs < 5% mean error at 2 mTorr
+
+geom.R = 0.06; 
+geom.L = 0.10; 
 geom.Tg0 = 300;
-p0       = 0.266645;
 
-% --- params
-params.geom    = geom;
-params.p0      = p0;
-params.Vgrid   = 1000;
-params.beta_i  = 0.7;
-params.beta_g  = 0.3;
-params.sigma_i = 5e-18;   % m^2 (optimized value)
-params.Tg0     = geom.Tg0;
-params.gamma_m = 0.2;
-params.gamma_r = 0.5;
-params.gamma_p = 1;
-params.gamma_g = 1e-5;
-params.Q0 = 1.13e18;
-params.s_sheath = 1.5e-3;
-params.sigma_nn = 4e-19;
-params.ps = struct();
-params.f_RF   = 13.56e6;
-params.omega  = 2*pi*params.f_RF;
-params.Nturns = 5;
-params.Rcoil  = 2;
-params.Rc     = 0.07;
-params.lc     = geom.L;
-params.f_sheath = 0.55;
+base_params.geom = geom;
+base_params.Vgrid = 1000;
+base_params.beta_i = 0.7;
+base_params.beta_g = 0.3;
+base_params.Q0 = 4.5e18;
+base_params.s_sheath = 1.5e-3;
+base_params.ps = struct();
 
-% --- Constants
-kB = 1.380649e-23; 
-qe = 1.602176634e-19; 
-MAr = 39.948*1.66053906660e-27;
-V = pi*geom.R^2*geom.L;
+% RF and circuit parameters
+base_params.f_RF = 13.56e6;
+base_params.omega = 2*pi*base_params.f_RF;
+base_params.Nturns = 5;
+base_params.Rc = 0.07;
+base_params.lc = geom.L;
+base_params.f_sheath = 0.55;
 
-% --- Initial conditions at low power
-iAr=1; iArm=2; iArr=3; iArp=4; iI=5; iTe=6; iTg=7;
+% Power model: use circuit model
+base_params.power_model = 'circuit';
 
-nAr_0  = 6.4e19;
-nArm_0 = 1e17;
-nArr_0 = 7e16;
-nArp_0 = 1e15;
-ne_0   = 3e17;
-Te_0   = 3.6;
-Tg_0   = 310;
+% ========================================
+% OPTIMIZED PARAMETERS (from inverse optimization)
+% Validated at 2 mTorr with < 5% error on all outputs
+% ========================================
+base_params.Rcoil = 0.543183;
+base_params.sigma_heating = 4.852125e-18;
+base_params.sigma_nn = 8.236909e-19;
+base_params.sigma_i = 7.446966e-19;
+base_params.gamma_g = 1.000000e-04;
+base_params.gamma_m = 0.001110;
+base_params.gamma_r = 0.001945;
+base_params.gamma_p = 0.005982;
 
-y0 = [nAr_0; nArm_0; nArr_0; nArp_0; ne_0; Te_0; Tg_0];
+% Reference pressure for scaling
+base_params.p_ref = 0.266645;  % 2 mTorr in Pa
 
-% Power sweep - adjust to cover Pabs = 0-600W
-% Since Pabs ≈ 0.3-0.5 * PRF, use PRF from 0 to ~1800W
-PRF_vec = linspace(10, 100, 30).';  % Start from 50W to avoid convergence issues
-N = length(PRF_vec);
+%% Step 3: Preallocate Results
+results = struct();
+results.Power = zeros(N_total, 1);
+results.Pressure_mTorr = zeros(N_total, 1);
+results.Pressure_Pa = zeros(N_total, 1);
+results.nAr = zeros(N_total, 1);
+results.nArm = zeros(N_total, 1);
+results.nArr = zeros(N_total, 1);
+results.nArp = zeros(N_total, 1);
+results.ne = zeros(N_total, 1);
+results.Te_model = zeros(N_total, 1);  % Keep for reference (not for NN training)
+results.Tg = zeros(N_total, 1);
+results.converged = zeros(N_total, 1);
 
-% Storage
-Y = nan(N, 7);
-Pabs_vec = nan(N, 1);
-PRF_actual = nan(N, 1);
-
-% ODE options
-opts = odeset('RelTol', 1e-7, ...
-              'AbsTol', [1e14 1e13 1e13 1e12 1e13 1e-5 0.01], ...
+%% Step 4: Run Parameter Sweep
+opts = odeset('RelTol', 1e-6, ...
+              'AbsTol', [1e14 1e13 1e13 1e12 1e13 1e-4 0.1], ...
               'NonNegative', 1:7);
 
-fprintf('Running power sweep for Pabs vs densities...\n');
-fprintf('PRF (W)  Pabs (W)   ne (m^-3)    Te (eV)    Tg (K)\n');
-fprintf('--------------------------------------------------------\n');
+fprintf('Running simulations...\n');
+fprintf('Progress: ');
 
-% First point
-params.PRF = PRF_vec(1);
-tspan = [0, 0.1];
-sol = ode15s(@(t,z) rhs_global(t,z,params,[]), tspan, y0, opts);
-y = sol.y(:,end);
-Y(1,:) = y.';
-PRF_actual(1) = params.PRF;
+idx = 0;
+tic;
 
-% Calculate Pabs for first point
-ne_temp = y(iI);
-Tg_temp = y(iTg);
-n_g_temp = y(iAr) + y(iArm) + y(iArr) + y(iArp);
-R_temp = RateCoefficients_Ar(params.Tg0, params.p0, y(iTe));
-Kel_temp = max(R_temp.k1, 0);
-nu_m_temp = n_g_temp * Kel_temp;
-Rind_temp = calc_rind(params, ne_temp, nu_m_temp);
-I2_temp = 2*params.PRF / (Rind_temp + params.Rcoil);
-Pcoil_temp = 0.5 * params.Rcoil * I2_temp;
-Pabs_vec(1) = (params.PRF - Pcoil_temp);
-
-fprintf('%6.0f   %6.1f   %.2e   %.3f   %.1f\n', ...
-        PRF_actual(1), Pabs_vec(1), y(iI), y(iTe), y(iTg));
-
-% Continue sweep
-for i = 2:N
-    params.PRF = PRF_vec(i);
-    tspan = [0, 0.02];
+for i = 1:N_pressure
+    % Set pressure for this sweep
+    params = base_params;
+    params.p0 = pressure_Pa_vec(i);
     
-    sol = ode15s(@(t,z) rhs_global(t,z,params,[]), tspan, y, opts);
-    y = sol.y(:,end);
-    Y(i,:) = y.';
-    PRF_actual(i) = params.PRF;
+    % Initial condition (reset for each pressure)
+    % Scale initial neutral density with pressure using ideal gas law
+    kB = 1.380649e-23;
+    n_g0 = params.p0 / (kB * geom.Tg0);
     
-    % Calculate Pabs
-    ne_temp = y(iI);
-    Tg_temp = y(iTg);
-    n_g_temp = y(iAr) + y(iArm) + y(iArr) + y(iArp);
-    R_temp = RateCoefficients_Ar(params.Tg0, params.p0, y(iTe));
-    Kel_temp = max(R_temp.k1, 0);
-    nu_m_temp = n_g_temp * Kel_temp;
-    Rind_temp = calc_rind(params, ne_temp, nu_m_temp);
-    I2_temp = 2*params.PRF / (Rind_temp + params.Rcoil);
-    Pcoil_temp = 0.5 * params.Rcoil * I2_temp;
-    Pabs_vec(i) = (params.PRF - Pcoil_temp);
+    % Initial state: [nAr, nArm, nArr, nArp, ne, Te, Tg]
+    y0 = [n_g0;           % nAr: most neutrals are ground state
+          n_g0 * 1e-3;    % nArm: small metastable fraction
+          n_g0 * 1e-3;    % nArr: small resonant fraction  
+          n_g0 * 1e-5;    % nArp: very small 4p fraction
+          n_g0 * 5e-3;    % ne: ionization fraction ~0.5%
+          3.5;            % Te: typical electron temperature (eV)
+          310];           % Tg: slightly above wall temperature (K)
     
-    fprintf('%6.0f   %6.1f   %.2e   %.3f   %.1f\n', ...
-            PRF_actual(i), Pabs_vec(i), y(iI), y(iTe), y(iTg));
+    for j = 1:N_power
+        idx = idx + 1;
+        params.PRF = power_vec(j);
+        
+        % Time span (longer for first point, shorter for continuation)
+        if j == 1
+            tspan = [0, 1.0];  % Longer to reach steady state at new pressure
+        else
+            tspan = [0, 0.2];  % Shorter for continuation from previous point
+        end
+        
+        try
+            sol = ode15s(@(t,z) rhs_global(t,z,params,[]), tspan, y0, opts);
+            y_final = sol.y(:, end);
+            
+            % Check for valid results
+            if any(isnan(y_final)) || any(y_final < 0) || y_final(6) > 20 || y_final(7) > 1000
+                error('Invalid solution values');
+            end
+            
+            % Store results
+            results.Power(idx) = power_vec(j);
+            results.Pressure_mTorr(idx) = pressure_vec(i);
+            results.Pressure_Pa(idx) = pressure_Pa_vec(i);
+            results.nAr(idx) = y_final(1);
+            results.nArm(idx) = y_final(2);
+            results.nArr(idx) = y_final(3);
+            results.nArp(idx) = y_final(4);
+            results.ne(idx) = y_final(5);
+            results.Te_model(idx) = y_final(6);
+            results.Tg(idx) = y_final(7);
+            results.converged(idx) = 1;
+            
+            % Use final state as IC for next power point
+            y0 = y_final;
+            
+        catch ME
+            % Mark as failed
+            results.Power(idx) = power_vec(j);
+            results.Pressure_mTorr(idx) = pressure_vec(i);
+            results.Pressure_Pa(idx) = pressure_Pa_vec(i);
+            results.converged(idx) = 0;
+            fprintf('\nFailed at P=%.0fW, p=%.1f mTorr: %s\n', ...
+                    power_vec(j), pressure_vec(i), ME.message);
+            
+            % Try to continue with reset IC
+            y0 = [n_g0; n_g0*1e-3; n_g0*1e-3; n_g0*1e-5; n_g0*5e-3; 3.5; 310];
+        end
+    end
+    
+    % Progress indicator
+    fprintf('%.0f%% ', i/N_pressure*100);
 end
 
-%% Print densities at 15 W (add after the power sweep loop, before plotting)
+elapsed = toc;
+fprintf('\nDone! Elapsed time: %.1f seconds (%.3f s per point)\n\n', elapsed, elapsed/N_total);
 
-%% Extract exact densities at Pabs = 15 W (add after the power sweep loop)
+%% Step 5: Check Convergence
+n_converged = sum(results.converged);
+n_failed = N_total - n_converged;
+fprintf('Convergence: %d/%d (%.1f%%) succeeded\n', n_converged, N_total, n_converged/N_total*100);
 
-% Interpolate all variables at exactly Pabs = 15W
-Pabs_target = 15.0;
+if n_failed > 0
+    fprintf('WARNING: %d points failed to converge\n', n_failed);
+    
+    % Show which pressure/power combinations failed
+    failed_idx = find(results.converged == 0);
+    if length(failed_idx) <= 20
+        fprintf('Failed points:\n');
+        for fi = 1:length(failed_idx)
+            fprintf('  P=%.0fW, p=%.1f mTorr\n', ...
+                    results.Power(failed_idx(fi)), results.Pressure_mTorr(failed_idx(fi)));
+        end
+    end
+end
+fprintf('\n');
 
-nAr_15W  = interp1(Pabs_vec, Y(:,iAr), Pabs_target, 'linear');
-nArm_15W = interp1(Pabs_vec, Y(:,iArm), Pabs_target, 'linear');
-nArr_15W = interp1(Pabs_vec, Y(:,iArr), Pabs_target, 'linear');
-nArp_15W = interp1(Pabs_vec, Y(:,iArp), Pabs_target, 'linear');
-ne_15W   = interp1(Pabs_vec, Y(:,iI), Pabs_target, 'linear');
-Te_15W   = interp1(Pabs_vec, Y(:,iTe), Pabs_target, 'linear');
-Tg_15W   = interp1(Pabs_vec, Y(:,iTg), Pabs_target, 'linear');
+%% Step 6: Filter to Converged Points Only
+mask = results.converged == 1;
+clean_results = struct();
+clean_results.Power = results.Power(mask);
+clean_results.Pressure_mTorr = results.Pressure_mTorr(mask);
+clean_results.Pressure_Pa = results.Pressure_Pa(mask);
+clean_results.nAr = results.nAr(mask);
+clean_results.nArm = results.nArm(mask);
+clean_results.nArr = results.nArr(mask);
+clean_results.nArp = results.nArp(mask);
+clean_results.ne = results.ne(mask);
+clean_results.Te_model = results.Te_model(mask);
+clean_results.Tg = results.Tg(mask);
 
-fprintf('\n=== DENSITIES AT Pabs = %.2f W (interpolated) ===\n', Pabs_target);
-fprintf('  nAr  = %.4e m^-3\n', nAr_15W);
-fprintf('  nArm = %.4e m^-3\n', nArm_15W);
-fprintf('  nArr = %.4e m^-3\n', nArr_15W);
-fprintf('  nArp = %.4e m^-3\n', nArp_15W);
-fprintf('  ne   = %.4e m^-3\n', ne_15W);
-fprintf('  Te   = %.3f eV\n', Te_15W);
-fprintf('  Tg   = %.1f K\n\n', Tg_15W);
+%% Step 7: Save to CSV (for Python/sklearn)
+% NN Inputs: Power, Pressure
+% NN Outputs: nAr, nArm, nArr, nArp, ne, Tg (6 outputs)
+% Note: Te_model included for reference but NOT recommended for training
 
+T = table(clean_results.Power, clean_results.Pressure_mTorr, clean_results.Pressure_Pa, ...
+          clean_results.nAr, clean_results.nArm, clean_results.nArr, clean_results.nArp, ...
+          clean_results.ne, clean_results.Tg, clean_results.Te_model, ...
+          'VariableNames', {'Power_W', 'Pressure_mTorr', 'Pressure_Pa', ...
+                           'nAr', 'nArm', 'nArr', 'nArp', 'ne', 'Tg', 'Te_model'});
 
+writetable(T, 'nn_training_data.csv');
+fprintf('Training data saved to nn_training_data.csv\n');
 
-%% Create Plots
+%% Step 8: Save to MAT file (for MATLAB use)
+save('nn_training_data.mat', 'clean_results', 'power_vec', 'pressure_vec', 'base_params');
+fprintf('Training data saved to nn_training_data.mat\n\n');
 
-% Extract densities
-nAr = Y(:,iAr);
-nArm = Y(:,iArm);
-nArr = Y(:,iArr);
-nArp = Y(:,iArp);
-ne = Y(:,iI);
-Te = Y(:,iTe);
-Tg = Y(:,iTg);
+%% Step 9: Generate Statistics
+fprintf('========================================\n');
+fprintf('DATA STATISTICS\n');
+fprintf('========================================\n');
+fprintf('%-12s | %12s | %12s | %12s\n', 'Variable', 'Min', 'Max', 'Mean');
+fprintf('-------------|--------------|--------------|-------------\n');
+fprintf('%-12s | %12.0f | %12.0f | %12.0f\n', 'Power (W)', min(clean_results.Power), max(clean_results.Power), mean(clean_results.Power));
+fprintf('%-12s | %12.2f | %12.2f | %12.2f\n', 'Pressure', min(clean_results.Pressure_mTorr), max(clean_results.Pressure_mTorr), mean(clean_results.Pressure_mTorr));
+fprintf('%-12s | %12.2e | %12.2e | %12.2e\n', 'nAr', min(clean_results.nAr), max(clean_results.nAr), mean(clean_results.nAr));
+fprintf('%-12s | %12.2e | %12.2e | %12.2e\n', 'nArm', min(clean_results.nArm), max(clean_results.nArm), mean(clean_results.nArm));
+fprintf('%-12s | %12.2e | %12.2e | %12.2e\n', 'nArr', min(clean_results.nArr), max(clean_results.nArr), mean(clean_results.nArr));
+fprintf('%-12s | %12.2e | %12.2e | %12.2e\n', 'nArp', min(clean_results.nArp), max(clean_results.nArp), mean(clean_results.nArp));
+fprintf('%-12s | %12.2e | %12.2e | %12.2e\n', 'ne', min(clean_results.ne), max(clean_results.ne), mean(clean_results.ne));
+fprintf('%-12s | %12.2f | %12.2f | %12.2f\n', 'Tg (K)', min(clean_results.Tg), max(clean_results.Tg), mean(clean_results.Tg));
+fprintf('%-12s | %12.3f | %12.3f | %12.3f\n', 'Te (eV)', min(clean_results.Te_model), max(clean_results.Te_model), mean(clean_results.Te_model));
 
-% Filter to Pabs = 0-600W range
-idx = Pabs_vec <= 600;
-Pabs_plot = Pabs_vec(idx);
-nAr_plot = nAr(idx);
-nArm_plot = nArm(idx);
-nArr_plot = nArr(idx);
-nArp_plot = nArp(idx);
-ne_plot = ne(idx);
-Te_plot = Te(idx);
-Tg_plot = Tg(idx);
+%% Step 10: Visualizations
+figure('Color', 'w', 'Position', [100 100 1400 900]);
 
-figure('Position', [100 100 1200 800]);
+% Define pressures to plot
+pressures_to_plot = [1, 2, 5, 10];  % mTorr
+colors = lines(length(pressures_to_plot));
 
-% Plot 1: All neutral species
-subplot(2,2,1)
-hold on
-plot(Pabs_plot, nAr_plot, 'b-o', 'LineWidth', 2, 'MarkerSize', 6)
-plot(Pabs_plot, nArm_plot, 'r-s', 'LineWidth', 2, 'MarkerSize', 6)
-plot(Pabs_plot, nArr_plot, 'g-d', 'LineWidth', 2, 'MarkerSize', 6)
-plot(Pabs_plot, nArp_plot, 'm-^', 'LineWidth', 2, 'MarkerSize', 6)
-hold off
-xlabel('Absorbed Power, P_{abs} (W)', 'FontSize', 12)
-xlim = [0 100];
-xline(15, 'k--', 'LineWidth', 1.5, 'Label', '15W');
-ylabel('Density (m^{-3})', 'FontSize', 12)
-title('Neutral Species Densities vs Absorbed Power', 'FontSize', 14)
-legend('Ar (ground)', 'Ar^m (metastable)', 'Ar^r (resonant)', 'Ar^p (4p)', ...
-       'Location', 'best', 'FontSize', 10)
-grid on
-set(gca, 'FontSize', 11)
+% Plot 1: ne vs Power at different pressures
+subplot(2,3,1);
+hold on;
+for k = 1:length(pressures_to_plot)
+    p_target = pressures_to_plot(k);
+    mask_p = abs(clean_results.Pressure_mTorr - p_target) < 0.5;
+    if any(mask_p)
+        semilogy(clean_results.Power(mask_p), clean_results.ne(mask_p), '-', ...
+                 'Color', colors(k,:), 'LineWidth', 1.5, ...
+                 'DisplayName', sprintf('%.0f mTorr', p_target));
+    end
+end
+xlabel('Power (W)');
+ylabel('n_e (m^{-3})');
+title('Electron Density');
+legend('Location', 'best');
+grid on;
 
-% Plot 2: Electron density
-subplot(2,2,2)
-plot(Pabs_plot, ne_plot, 'b-o', 'LineWidth', 2, 'MarkerSize', 6)
-xlabel('Absorbed Power, P_{abs} (W)', 'FontSize', 12)
-xline(15, 'k--', 'LineWidth', 1.5, 'Label', '15W');
-ylabel('Electron Density (m^{-3})', 'FontSize', 12)
-title('Electron Density vs Absorbed Power', 'FontSize', 14)
-grid on
-set(gca, 'FontSize', 11)
+% Plot 2: Tg vs Power at different pressures
+subplot(2,3,2);
+hold on;
+for k = 1:length(pressures_to_plot)
+    p_target = pressures_to_plot(k);
+    mask_p = abs(clean_results.Pressure_mTorr - p_target) < 0.5;
+    if any(mask_p)
+        plot(clean_results.Power(mask_p), clean_results.Tg(mask_p), '-', ...
+             'Color', colors(k,:), 'LineWidth', 1.5, ...
+             'DisplayName', sprintf('%.0f mTorr', p_target));
+    end
+end
+xlabel('Power (W)');
+ylabel('T_g (K)');
+title('Gas Temperature');
+legend('Location', 'best');
+grid on;
 
-% Plot 3: Excited species (log scale)
-subplot(2,2,3)
-semilogy(Pabs_plot, nArm_plot, 'r-s', 'LineWidth', 2, 'MarkerSize', 6)
-hold on
-semilogy(Pabs_plot, nArr_plot, 'g-d', 'LineWidth', 2, 'MarkerSize', 6)
-semilogy(Pabs_plot, nArp_plot, 'm-^', 'LineWidth', 2, 'MarkerSize', 6)
-hold off
-xlabel('Absorbed Power, P_{abs} (W)', 'FontSize', 12)
-xline(15, 'k--', 'LineWidth', 1.5, 'Label', '15W');
-ylabel('Density (m^{-3})', 'FontSize', 12)
-title('Excited State Densities vs Absorbed Power (log scale)', 'FontSize', 14)
-legend('Ar^m', 'Ar^r', 'Ar^p', 'Location', 'best', 'FontSize', 10)
-grid on
-set(gca, 'FontSize', 11)
+% Plot 3: Te vs Power (for reference - not NN target)
+subplot(2,3,3);
+hold on;
+for k = 1:length(pressures_to_plot)
+    p_target = pressures_to_plot(k);
+    mask_p = abs(clean_results.Pressure_mTorr - p_target) < 0.5;
+    if any(mask_p)
+        plot(clean_results.Power(mask_p), clean_results.Te_model(mask_p), '-', ...
+             'Color', colors(k,:), 'LineWidth', 1.5, ...
+             'DisplayName', sprintf('%.0f mTorr', p_target));
+    end
+end
+xlabel('Power (W)');
+ylabel('T_e (eV)');
+title('Electron Temperature (Reference Only)');
+legend('Location', 'best');
+grid on;
 
-% Plot 4: Temperatures
-subplot(2,2,4)
-yyaxis left
-plot(Pabs_plot, Te_plot, 'b-o', 'LineWidth', 2, 'MarkerSize', 6)
-ylabel('Electron Temperature, T_e (eV)', 'FontSize', 12, 'Color', 'b')
-set(gca, 'YColor', 'b')
+% Plot 4: 2D surface - ne
+subplot(2,3,4);
+[P_grid, p_grid] = meshgrid(power_vec, pressure_vec);
+ne_grid = griddata(clean_results.Power, clean_results.Pressure_mTorr, ...
+                   log10(clean_results.ne), P_grid, p_grid);
+surf(P_grid, p_grid, ne_grid, 'EdgeColor', 'none');
+xlabel('Power (W)');
+ylabel('Pressure (mTorr)');
+zlabel('log_{10}(n_e)');
+title('Electron Density Surface');
+colorbar;
+view(45, 30);
 
-yyaxis right
-plot(Pabs_plot, Tg_plot, 'r-s', 'LineWidth', 2, 'MarkerSize', 6)
-ylabel('Gas Temperature, T_g (K)', 'FontSize', 12, 'Color', 'r')
-set(gca, 'YColor', 'r')
+% Plot 5: 2D surface - Tg
+subplot(2,3,5);
+Tg_grid = griddata(clean_results.Power, clean_results.Pressure_mTorr, ...
+                   clean_results.Tg, P_grid, p_grid);
+surf(P_grid, p_grid, Tg_grid, 'EdgeColor', 'none');
+xlabel('Power (W)');
+ylabel('Pressure (mTorr)');
+zlabel('T_g (K)');
+title('Gas Temperature Surface');
+colorbar;
+view(45, 30);
 
-xlabel('Absorbed Power, P_{abs} (W)', 'FontSize', 12)
-title('Temperatures vs Absorbed Power', 'FontSize', 14)
-legend('T_e', 'T_g', 'Location', 'best', 'FontSize', 10)
-grid on
-set(gca, 'FontSize', 11)
+% Plot 6: Data coverage with convergence
+subplot(2,3,6);
+scatter(clean_results.Power, clean_results.Pressure_mTorr, 30, clean_results.ne, 'filled');
+xlabel('Power (W)');
+ylabel('Pressure (mTorr)');
+title(sprintf('Training Data Coverage (%d points)', n_converged));
+colorbar;
+colormap(gca, 'parula');
+c = colorbar;
+c.Label.String = 'n_e (m^{-3})';
 
-sgtitle('Species Densities and Temperatures vs Absorbed Power', 'FontSize', 16, 'FontWeight', 'bold')
+sgtitle(sprintf('NN Training Data: %d Points (%.0f-%.0f W, %.0f-%.0f mTorr)', ...
+        n_converged, P_min, P_max, p_min, p_max), 'FontSize', 14, 'FontWeight', 'bold');
 
-%% Additional plot: All densities on one log plot
-figure('Position', [150 150 800 600]);
-semilogy(Pabs_plot, nAr_plot, 'b-o', 'LineWidth', 2, 'MarkerSize', 6)
-hold on
-semilogy(Pabs_plot, nArm_plot, 'r-s', 'LineWidth', 2, 'MarkerSize', 6)
-semilogy(Pabs_plot, nArr_plot, 'g-d', 'LineWidth', 2, 'MarkerSize', 6)
-semilogy(Pabs_plot, nArp_plot, 'm-^', 'LineWidth', 2, 'MarkerSize', 6)
-semilogy(Pabs_plot, ne_plot, 'k-*', 'LineWidth', 2, 'MarkerSize', 8)
-hold off
-xline(15, 'k--', 'LineWidth', 2, 'Label', 'P_{abs} = 15W')
-xlabel('Absorbed Power, P_{abs} (W)', 'FontSize', 14)
-ylabel('Density (m^{-3})', 'FontSize', 14)
-title('All Species Densities vs Absorbed Power', 'FontSize', 16, 'FontWeight', 'bold')
-legend('Ar', 'Ar^m', 'Ar^r', 'Ar^p', 'n_e', 'Location', 'best', 'FontSize', 12)
-grid on
-set(gca, 'FontSize', 12)
+saveas(gcf, 'nn_training_data_visualization.png');
+fprintf('\nVisualization saved to nn_training_data_visualization.png\n');
 
-%% Print summary statistics
-fprintf('\n=== SUMMARY ===\n');
-fprintf('Pabs range: %.1f - %.1f W\n', min(Pabs_plot), max(Pabs_plot));
-fprintf('At Pabs = %.1f W:\n', Pabs_plot(1));
-fprintf('  ne = %.2e m^-3, Te = %.2f eV, Tg = %.1f K\n', ne_plot(1), Te_plot(1), Tg_plot(1));
-fprintf('At Pabs = %.1f W:\n', Pabs_plot(end));
-fprintf('  ne = %.2e m^-3, Te = %.2f eV, Tg = %.1f K\n', ne_plot(end), Te_plot(end), Tg_plot(end));
-fprintf('Electron density increase: %.1fx\n', ne_plot(end)/ne_plot(1));
-fprintf('Te change: %.3f eV\n', Te_plot(end) - Te_plot(1));
-fprintf('Tg change: %.1f K\n', Tg_plot(end) - Tg_plot(1));
+%% Step 11: Species plots
+figure('Color', 'w', 'Position', [150 150 1200 500]);
+
+species = {'nAr', 'nArm', 'nArr', 'nArp', 'ne'};
+species_labels = {'Ar', 'Ar^m', 'Ar^r', 'Ar^p', 'n_e'};
+species_data = {clean_results.nAr, clean_results.nArm, clean_results.nArr, ...
+                clean_results.nArp, clean_results.ne};
+
+for s = 1:5
+    subplot(1,5,s);
+    hold on;
+    for k = 1:length(pressures_to_plot)
+        p_target = pressures_to_plot(k);
+        mask_p = abs(clean_results.Pressure_mTorr - p_target) < 0.5;
+        if any(mask_p)
+            semilogy(clean_results.Power(mask_p), species_data{s}(mask_p), '-', ...
+                     'Color', colors(k,:), 'LineWidth', 1.5);
+        end
+    end
+    xlabel('Power (W)');
+    ylabel('Density (m^{-3})');
+    title(species_labels{s});
+    grid on;
+end
+legend(arrayfun(@(x) sprintf('%d mTorr', x), pressures_to_plot, 'UniformOutput', false), ...
+       'Location', 'best');
+sgtitle('Species Densities vs Power at Different Pressures', 'FontSize', 12);
+saveas(gcf, 'nn_training_species.png');
+
+%% Summary
+fprintf('\n========================================\n');
+fprintf('SUMMARY\n');
+fprintf('========================================\n');
+fprintf('Training points generated: %d / %d (%.1f%%)\n', n_converged, N_total, n_converged/N_total*100);
+fprintf('\nInput features (2):\n');
+fprintf('  - Power: %.0f - %.0f W\n', P_min, P_max);
+fprintf('  - Pressure: %.1f - %.1f mTorr\n', p_min, p_max);
+fprintf('\nOutput targets (6) - for NN training:\n');
+fprintf('  - nAr   (ground state Ar density)\n');
+fprintf('  - nArm  (metastable Ar density)\n');
+fprintf('  - nArr  (resonant Ar density)\n');
+fprintf('  - nArp  (4p state Ar density)\n');
+fprintf('  - ne    (electron density)\n');
+fprintf('  - Tg    (gas temperature)\n');
+fprintf('\nNOTE: Te_model is included for reference but\n');
+fprintf('should NOT be used as NN target due to ~3-5%%\n');
+fprintf('overestimation in the 0D global model.\n');
+fprintf('========================================\n');
+
+fprintf('\nFiles created:\n');
+fprintf('  - nn_training_data.csv (for Python)\n');
+fprintf('  - nn_training_data.mat (for MATLAB)\n');
+fprintf('  - nn_training_data_visualization.png\n');
+fprintf('  - nn_training_species.png\n');
